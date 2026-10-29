@@ -468,3 +468,217 @@ erDiagram
 | `seats`, `orders`, `queue_entries` | `event_id`                | Сильный перекос     | Старт продаж, транзакционная локальность |
 | `events`, `reviews`                | `event_id` (реплики)      | Перекос чтений      | Популярность                             |
 | `orders`, `tickets`                | Время события             | Перекос по возрасту | Обращения к ближайшим событиям           |
+
+## 6. Физическая схема БД
+
+```mermaid
+erDiagram
+    venues ||--o{ events : ""
+    events ||--o{ event_media : ""
+    events ||--o{ reviews : ""
+    users ||--o{ reviews : ""
+    events ||--o{ seats : ""
+    events ||--o{ orders : ""
+    users ||--o{ orders : ""
+    orders ||--o{ tickets : ""
+    seats ||--o{ tickets : ""
+    orders ||--o| user_orders : "проекция"
+    users ||--o| user_feed : "проекция"
+
+    users {
+        uuid id PK
+        citext email UK
+        text password_hash
+        text name
+        text phone
+        text city
+        user_role role
+        timestamptz created_at
+    }
+    venues {
+        uuid id PK
+        text name
+        text address
+        text city
+        float8 lat
+        float8 lon
+        int capacity
+        dc home_dc
+    }
+    events {
+        uuid id PK
+        uuid organizer_id FK
+        uuid venue_id FK
+        dc home_dc "денорм.: из venues"
+        text title
+        text description
+        text category
+        timestamptz starts_at
+        timestamptz sale_starts_at
+        event_status status
+        int rating_sum "денорм.: из reviews"
+        int reviews_count "денорм.: из reviews"
+    }
+    event_media {
+        uuid id PK
+        uuid event_id FK
+        text object_key
+        media_kind kind
+        smallint position
+        smallint width
+        smallint height
+    }
+    reviews {
+        uuid id PK
+        uuid event_id FK
+        uuid user_id FK
+        text author_name "денорм.: из users"
+        smallint rating
+        text body
+        timestamptz created_at
+    }
+    seats {
+        uuid event_id PK "ключ шарда"
+        uuid id PK
+        text sector
+        text row_no
+        text seat_no
+        text price_category
+        numeric price
+        seat_status status
+        uuid hold_order_id
+        timestamptz hold_expires_at
+        int version
+    }
+    orders {
+        uuid event_id PK "ключ шарда"
+        uuid id PK
+        uuid user_id
+        order_status status
+        numeric total
+        char currency
+        text payment_ref
+        text idempotency_key UK
+        timestamptz created_at
+        timestamptz paid_at
+    }
+    tickets {
+        uuid event_id PK "денорм.: ключ шарда"
+        uuid id PK
+        uuid order_id FK
+        uuid seat_id FK
+        numeric price
+        text barcode UK "префикс: event_id"
+        ticket_status status
+        timestamptz used_at
+    }
+    user_orders {
+        uuid user_id PK "Cassandra: partition key"
+        timestamp created_at PK "clustering DESC"
+        uuid order_id PK
+        uuid event_id
+        text event_title "денорм."
+        timestamp event_starts_at "денорм."
+        text venue_name "денорм."
+        text status
+        text[] barcodes "денорм."
+    }
+    user_feed {
+        uuid user_id PK "Cassandra"
+        uuid[] event_ids
+        timestamp computed_at
+    }
+```
+
+Также в PostgreSQL храним таблицу `outbox (id bigserial, topic, key, payload jsonb, created_at)` (вместе в Debezium решает проблему оповещения), а в Redis хранятся ключи:
+
+| Ключ Redis                | Структура    | Содержимое                                          | TTL                  |
+| ------------------------- | ------------ | --------------------------------------------------- | -------------------- |
+| `sess:{token_hash}`       | Hash         | `user_id`, `role`, `ip`, `expires_at`               | 30 дней              |
+| `user_sess:{user_id}`     | Set          | Токены пользователя (для "выйти везде")             | 30 дней              |
+| `q:{event_id}:seq`        | String       | Счетчик выданных позиций (`INCR`)                   | До конца продаж      |
+| `q:{event_id}:served`     | String       | Последняя допущенная позиция                        | До конца продаж      |
+| `avail:{event_id}`        | Hash         | Статусы мест и счетчики по категориям цен           | До конца события     |
+
+### Таблицы
+
+| Таблица        | Что и зачем                                              | Денормализованные поля                                  |
+| -------------- | ------------------------------------------------------- | ------------------------------------------------------- |
+| `users`        | Аккаунты покупателей и организаторов                    | —                                                       |
+| Сессии (Redis) | Активные сессии для проверки на L7                          | `user_id`, `role`                                       |
+| `venues`       | Площадки и их расположение              | —                                                       |
+| `events`       | Метаданные событий                                      | `home_dc`, `rating_sum`, `reviews_count`                |
+| `event_media`  | Медиа файлы событий                      | —                                                       |
+| `seats`        | Места и слоты события, их цена и статус                     | —                                                       |
+| `orders`       | Заказы и статус оплаты                                  | —                                                       |
+| `tickets`      | Выписанные билеты                                       | `event_id`                                              |
+| `reviews`      | Отзывы и оценки                                         | `author_name`                                           |
+| `outbox`       | Изменения для публикации в Kafka                        | —                                                       |
+| `user_orders`  | "Мои билеты"5                       | Название, дата и площадка события, штрихкоды            |
+| `user_feed`    | Готовая лента рекомендаций                              | —                                                       |
+
+### Денормализация
+
+| Поле                                   | Зачем                                                               | Когда записываем |
+| -------------------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `events.home_dc`                       | Маршрутизация покупки без JOIN с `venues`                           | Записывается при создании события                            |
+| `events.rating_sum`, `reviews_count`   | Рейтинг на странице события (~1160 RPS) без агрегации по `reviews`  | В одной транзакции с отзывом        |
+| `reviews.author_name`                  | Отзывы без обращения к кластеру `users`                             | При создании; смена имени через outbox     |
+| `tickets.event_id`                     | Ключ шарда: билет находится на входе без поиска заказа              | При выпуске билета                                           |
+| `user_orders`                          | История по `user_id`, а `orders` шардированы по `event_id`          | Из outbox                  |
+| Сессия: `user_id`, `role`              | Авторизация без чтения `users` на каждом запросе                     | При входе; смена роли сбрасывает сессии                      |
+
+### Выбор СУБД
+
+| Данные                                       | СУБД                      | Почему                                                                         |
+| -------------------------------------------- | ------------------------- | ------------------------------------------------------------------------------ |
+| `users`, `venues`, `events`, `event_media`, `reviews`, `seats`, `orders`, `tickets`    | PostgreSQL                | Подходят под реляционную модель; нужны транзакции                               |
+| Сессии, очередь, доступность мест            | Redis                     | Десятки тысяч операций/с, эфемерные данные  |
+| `user_orders`, `user_feed`                   | Cassandra                 | Доступ только по ключу, ~1.3 ТБ, встроенная репликация между ДЦ                |
+| Поисковый индекс                             | OpenSearch             | Полнотекстовый поиск                                 |
+| Поток изменений                              | Kafka + Debezium          | Публикация из `outbox` без двойной записи                                      |
+| Медиа                                        | Ceph RGW (S3)             | Объектное S3 хранилище — стандарт индустрии для медиа; А MinIO себя убил...    |
+| Логи                                         | ClickHouse                | Колоночное хранение, только добавление                                         |
+
+### Индексы
+
+| Таблица       | Индекс                                                         | Для чего                                         |
+| ------------- | -------------------------------------------------------------- | ------------------------------------------------ |
+| `users`       | `UNIQUE (email)`                                               | Вход                                             |
+| `events`      | `(venue_id)`                                                   | События площадки                                 |
+| `events`      | `(organizer_id, starts_at)`                                    | Кабинет организатора                             |
+| `events`      | `(starts_at) WHERE status = 'on_sale'`                         | Предстоящие события                              |
+| `event_media` | `(event_id, position)`                                         | Галерея события по порядку                       |
+| `reviews`     | `UNIQUE (event_id, user_id)`                                   | Один отзыв на пользователя                       |
+| `reviews`     | `(event_id, created_at DESC)`                                  | Первая страница отзывов                          |
+| `seats`       | `PK (event_id, id)`                                            | Схема зала: все места события подряд             |
+| `seats`       | `(hold_expires_at) WHERE status = 'held'`                      | Снятие просроченных броней                       |
+| `orders`      | `UNIQUE (event_id, idempotency_key)`                           | Повторные запросы оплаты                         |
+| `orders`      | `(created_at) WHERE status = 'pending'`                        | Сверка с платежным провайдером                   |
+| `tickets`     | `UNIQUE (barcode)`                                             | Проверка на входе                                |
+| `tickets`     | `(event_id, order_id)`                                         | Билеты заказа                                    |
+| `tickets`     | `UNIQUE (event_id, seat_id) WHERE status <> 'refunded'`        | Дополнительная защита от двойной продажи     |
+| `user_orders` | Partition `user_id`, clustering `created_at DESC`              | Последние заказы одним чтением                   |
+
+### Шардирование и резервирование
+
+| Данные                              | Sharding                                                      | Реплики                                                                       | При отказе                                                                     |
+| ----------------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `users`                             | Нет (~30 ГБ) | Primary & sync standby в Ashburn + async-реплики в остальных | Повышается реплика Dallas, потом Hillsboro |
+| `venues`, `events`, `event_media`, `reviews` | 3 shard-а по `home_dc` (~50 ГБ каждый) | Primary & sync standby в домашнем ДЦ; async-реплики во всех ДЦ | Повышается реплика в соседнем ДЦ |
+| Продажи: `seats`, `orders`, `tickets` | В каждом ДЦ 4 shard-а; Разбиваем на 64 bucket-а по `event_id`, потом в shard | Primary & sync standby, плюс async standby в соседнем ДЦ | Standby в ДЦ, затем в соседнем ДЦ |
+| Сессии (Redis)                      | Нет (~9 ГБ) | В каждом ДЦ master + 2 реплики (Sentinel); между ДЦ — через Kafka   | Sentinel повышает реплику |
+| Очередь, доступность мест (Redis)   | По событию, в домашнем ДЦ | Master + реплика, AOF раз в секунду | Восстанавливаем очередь по подписанным токенам и доступность из `seats` |
+| `user_orders`, `user_feed`          | Кольцо Cassandra по `user_id` | Один кластер на 3 ДЦ, RF = 3 в каждом, `LOCAL_QUORUM` | Переживает потерю узла в ДЦ и целого ДЦ |
+| Поиск (OpenSearch)                  | 1 шард (~2.5 ГБ) | Кластер из 3 узлов в каждом ДЦ, 2 реплики | Пересборка |
+| Kafka                               | Партиции по ключу сущности | 3 брокера в ДЦ, RF = 3; MirrorMaker 2 между ДЦ | — |
+| Медиа (Ceph)                        | Автоматически (CRUSH) | Erasure coding 8+3 в ДЦ, копия во втором ДЦ | Чтение из второго ДЦ |
+
+Перед крупным событием можно перенести его bucket в отдельный shard.
+Старые события можно переносить в медленное архивное хранилище.
+
+### Подключение и балансировка
+
+* Для мультиплексирования используется PgBouncer в режиме transaction pooling (у нас *очень* много pod-ов, и каждый хочет доступ к БД...).
+* Для записи используем HAProxy, проверяющий Primary через Patroni. Для чтения `leastconn` и `/replica?lag=1MB`.
+* Redis, Cassandra, OpenSearch не нуждаются в проксировании.
