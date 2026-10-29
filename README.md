@@ -331,20 +331,18 @@ erDiagram
         float lat
         float lon
         int capacity
+        enum home_dc "ближайший ДЦ"
     }
     events {
         uuid id PK
         uuid organizer_id FK
         uuid venue_id FK
-        enum home_dc "копируется из площадки"
         string title
         text description
         string category
         timestamp starts_at
         timestamp sale_starts_at
         enum status "draft | on_sale | sold_out | finished | cancelled"
-        int rating_sum
-        int reviews_count
     }
     event_media {
         uuid id PK
@@ -364,12 +362,12 @@ erDiagram
         string price_category
         decimal price
         enum status "free | held | sold | blocked"
-        string hold_order_id FK
+        uuid hold_order_id FK
         timestamp hold_expires_at
         int version
     }
     orders {
-        string id PK "включает event_id"
+        uuid id PK
         uuid user_id FK
         uuid event_id FK
         enum status "pending | paid | failed | refunded"
@@ -382,11 +380,10 @@ erDiagram
     }
     tickets {
         uuid id PK
-        string order_id FK
-        uuid event_id FK
+        uuid order_id FK
         uuid seat_id FK
-        decimal price
-        string barcode UK "включает event_id"
+        decimal price "цена на момент покупки"
+        string barcode UK
         enum status "valid | used | refunded"
         timestamp used_at
     }
@@ -394,7 +391,6 @@ erDiagram
         uuid id PK
         uuid event_id FK
         uuid user_id FK
-        string author_name "денормализовано"
         int rating "1-5"
         text body
         timestamp created_at
@@ -431,7 +427,7 @@ erDiagram
 | `users`         | 100 / 400                     | Вход по email, данные покупателя при оформлении                      | 1 / 4                                   | Регистрация (0.2/с), правки профиля    |
 | `sessions`      | 2600 / 10&nbsp;000            | Проверка каждого запроса на L7                                       | 280 / 1100                              | Вход, продление, выход                 |
 | `venues`        | 520 / 2100                    | Вместе с событием                                                    | ~0                                      | Администраторы                         |
-| `events`        | 520 / 2100                    | Страница события (290/с) и карточки в поиске и ленте (230/с по 20)   | 1 / 4                                   | Новые события, правки, рейтинг         |
+| `events`        | 520 / 2100                    | Страница события (290/с) и карточки в поиске и ленте (230/с по 20)   | 1 / 4                                   | Новые события, правки                  |
 | `event_media`   | 520 / 2100                    | Вместе с `events`                                                    | 0.1 / 0.4                               | Загрузка организатором                 |
 | `seats`         | 60 / 230                      | Схема зала: все места события                                        | 20 / 80; сотни/с при старте продаж      | Бронь, продажа, снятие брони           |
 | `orders`        | 10 / 40                       | Оформление, статус оплаты                                            | 8 / 32; сотни/с при старте продаж       | Создание и смена статуса               |
@@ -446,7 +442,6 @@ erDiagram
 | Объектное хранилище медиа      | Оригиналы и оптимизированные версии                                   | ~48 ТБ + ~1.6 ТБ версий    | 6100 / 24&nbsp;000 в секунду на CDN; 300 / 1200 на БД   | ~0.1 файл/с и генерация версий         | —                      |
 | Поисковый индекс               | Название, исполнители, площадка, город, дата, категория               | ~2.5 ГБ на ДЦ              | 145 / 580                                               | ~1/с, отставание — секунды             | `events`, `venues`     |
 | Лента рекомендаций             | `user_id` → ~100 `event_id`                                           | ~50 ГБ                     | 87 / 350                                                | Пакетный пересчет, ~700/с в фоне       | `events`, `orders`     |
-| Заказы пользователя            | `user_id` → его заказы и билеты                                       | ~1.2 ТБ                    | 17 / 70                                                 | ~27/с, отставание — секунды            | `orders`, `tickets`    |
 | Кэш доступности мест           | `event_id` → карта статусов мест и счетчики по категориям             | <1 ГБ                      | 60 / 230; тысячи/с при старте продаж                    | При каждом изменении `seats`           | `seats`                |
 | Кэш ответов API                | Страницы событий, списки, отзывы                                      | ~20 ГБ на ДЦ               | 2000 / 8000, попадания ~90%                             | TTL от секунд до минут                 | Основные таблицы       |
 | Буфер изменений (outbox)       | Оплата заказа, изменение событий, и т.д. для проекций и писем         | ~20 ГБ за 7 дней           | ~30/с                                                   | ~30/с                                  | Основные таблицы       |
@@ -462,7 +457,7 @@ erDiagram
 | `users`                           | Read your writes           | Записи (~1/с) идут в один основной ДЦ; чтения — с локальных реплик, кроме короткого окна после изменения (read-your-writes). |
 | `sessions`                        | Eventual (~1 с) | Асинхронная репликация. |
 | `events`, `venues`, `event_media` | Eventual (отставание несколько секунд, до минуты в кешах) | Пишет домашний ДЦ, асинхронные реплики во всех ДЦ. |
-| `reviews`                         | Eventual; один отзыв на пользователя и событие | Уникальность `(event_id, user_id)` проверяется в домашнем ДЦ события; рейтинг в `events` пересчитывается асинхронно. |
+| `reviews`                         | Eventual; один отзыв на пользователя и событие | Уникальность `(event_id, user_id)` проверяется в домашнем ДЦ события. |
 | Производные данные                | Eventual, пересобираемые | Обновляются из outbox; при расхождении пересобираются из основных таблиц. Кэш доступности мест может отставать на 1–2 с — окончательная проверка все равно происходит при брони. |
 
 ### Распределение нагрузки по ключам
