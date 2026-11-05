@@ -1,4 +1,4 @@
-# Ticketmaster case study
+# Расчетно-пояснительная записка: VK Education High-load
 
 ## 1. Тема и целевая аудитория
 
