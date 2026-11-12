@@ -766,6 +766,3 @@ erDiagram
 | Kubernetes | Оркестратор для всей системы | Отказоустойчивость, автоматическое масштабирование, обеспечение rolling update, etc. |
 | Prometheus | Метрики | Стандарт, интеграция с Grafana |
 | Grafana | Observability | Множество интеграций |
-
-
-* Nginx -- L7 
