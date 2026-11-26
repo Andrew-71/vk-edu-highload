@@ -948,7 +948,7 @@ flowchart LR
 
     SVC -->|"/metrics"| PROM
     EXP -->|"/metrics"| PROM
-    PROM -->|"Service Layer Objectives"| AM --> ONCALL
+    PROM -->|"Service-Level Objectives"| AM --> ONCALL
     SVC -->|"логи, OpenTelemetry"| K --> CH
     PROM & CH --> G
 
