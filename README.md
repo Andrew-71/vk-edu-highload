@@ -765,11 +765,14 @@ erDiagram
 | ClickHouse | Логи | Популярный вариант колоночного хранилища с хорошей производительностью. |
 | Kubernetes | Оркестратор для всей системы | Отказоустойчивость, автоматическое масштабирование, обеспечение rolling update, etc. |
 | Prometheus | Метрики | Стандарт, интеграция с Grafana |
+| OpenTelemetry | Tracing | Нативная интеграция с nginx |
 | Grafana | Observability | Множество интеграций |
 
 ### Observability и логирование
 
 Метрики собираются через Prometheus в каждом ДЦ. Логи собираются из в ClickHouse через Kafka и хранятся 30 дней в быстром доступе, а затем в "холодном" хранилище.
+
+Присутствует tracing (например, для покупки) через OpenTelemetry и `ngx_otel_module`.
 
 Основные метрики:
 
@@ -908,7 +911,7 @@ flowchart LR
     PG -->|"WAL, outbox"| DBZ --> K
     LB -->|"логи"| K
     K --> PRJ & REC
-    K -->|"логи"| CH
+    K -->|"логи, tracing"| CH
     K -->|"сессии"| RS
     PRJ -->|"индекс"| OS
     PRJ -->|"user_orders"| CAS
