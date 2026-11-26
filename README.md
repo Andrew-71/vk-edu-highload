@@ -1009,3 +1009,35 @@ sequenceDiagram
 | События Kafka, сессии           | MirrorMaker 2                              | Асинхронно               | ~1 с             |
 | `user_orders`, `user_feed`      | Встроенная репликация Cassandra            | Асинхронно, `LOCAL_QUORUM` | <1 с          |
 | Медиа                           | Копия в другой ДЦ                    | Асинхронно               | Не более нескольких минут   |
+
+### Резервное копирование
+
+```mermaid
+flowchart LR
+    subgraph DC["Каждый из трех ДЦ"]
+        SVC["LVS, nginx, сервисы K8S"]
+        EXP["postgres, redis, kafka, и т.д."]
+        PROM[("Prometheus")]
+        AM["Alertmanager"]
+        K[("Kafka")]
+        CH[("ClickHouse<br/>логи, трейсы — 30 дней")]
+        PG[("PostgreSQL")]
+        PGB["pgBackRest"]
+        CEPH[("Ceph RGW")]
+    end
+
+    G["Grafana"]
+    ONCALL(["Дежурный"])
+    COLD[("Холодное хранилище<br/>Object Lock")]
+
+    SVC -->|"/metrics"| PROM
+    EXP -->|"/metrics"| PROM
+    PROM -->|"Service Layer Objectives"| AM --> ONCALL
+    SVC -->|"логи, OpenTelemetry"| K --> CH
+    PROM & CH --> G
+
+    PG -->|"WAL постоянно,<br/>полная копия раз в неделю"| PGB --> COLD
+    PG -->|"архив orders, tickets,<br/>reviews раз в месяц"| COLD
+    CH -->|"после 30 дней"| COLD
+    CEPH -->|"версии объектов"| COLD
+```
