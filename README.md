@@ -790,3 +790,202 @@ erDiagram
 | Outbox | Debezium + Kafka. |
 | CQRS | Страницы заказов и рекомендация для пользователя; индекс поиска; кэш свободных мест. |
 | Saga (оркестратор) | Покупка. Резервирование места, затем оплата, затем транзакция создания билета. Реверты — "освобождаем" место если не прошла оплата, делаем возврат денег если не удалось выпустить билет. |
+
+<!--### Graceful degradation
+
+| Компонент, который сломался | Что произойдет |
+| --------- | -------------- |
+| Поиск     | Показываем список категорий |
+| Рекомендации | Всем пользователям показываем общие рекомендации популярных событий в их городе |
+| Отзывы | Пропадают из интерфейса |-->
+
+## 10. Схема проекта
+
+### Схема взаимодействия сервисов
+
+#### Синхронный путь запроса
+
+```mermaid
+flowchart TB
+    U(["Пользователь"])
+    PSP["Платежный провайдер"]
+    DNS["GeoDNS по задержке<br/>www. api. queue. checkout."]
+    CDN["Cloudflare CDN<br/>static. media. + очередь"]
+    HOME["Домашний ДЦ события"]
+
+    U --> DNS
+    U --> CDN
+    PSP -.->|"webhook"| DNS
+
+    subgraph DC["Любой из ДЦ"]
+        LB["L3 ECMP -> L4 LVS -> L7 nginx<br/>TLS, кэш, rate limiting, auth_request"]
+
+        subgraph R["Обслуживается локально"]
+            EV["events"]
+            SR["search"]
+            FD["feed"]
+            RV["reviews"]
+            MY["my-orders"]
+        end
+
+        subgraph W["Продажи, в домашнем ДЦ"]
+            Q["queue"]
+            CO["checkout"]
+            PAY["payments"]
+        end
+
+        AUTH["auth"]
+        MD["media"]
+
+        RS[("Redis: сессии")]
+        PGC[("PostgreSQL: события")]
+        OS[("OpenSearch")]
+        CAS[("Cassandra")]
+        RQ[("Redis: очередь, avail")]
+        PGS[("PostgreSQL: продажи")]
+        CEPH[("Ceph RGW")]
+    end
+
+    DNS --> LB
+    CDN -->|"промахи ~5%"| LB
+    LB -.->|"auth_request"| AUTH
+    LB --> R
+    LB --> W
+    LB --> MD
+
+    AUTH --> RS
+    EV & RV --> PGC
+    SR --> OS
+    FD & MY --> CAS
+    MD --> CEPH
+    Q --> RQ
+    CO --> RQ
+    CO --> PGS
+    CO --> PAY
+    PAY -->|"списание"| PSP
+    W <==>|"закрытый L7-канал<br/>если ДЦ не домашний"| HOME
+```
+
+#### Асинхронные потоки и связи между ДЦ
+
+```mermaid
+flowchart LR
+    subgraph DC["Любой из трех ДЦ"]
+        PG[("PostgreSQL")]
+        DBZ["Debezium"]
+        K[("Kafka")]
+        PRJ["updater"]
+        REC["recommender"]
+        RPR["hold-remover"]
+        LB["L7 nginx и сервисы"]
+        OS[("OpenSearch")]
+        CAS[("Cassandra")]
+        RQ[("Redis: avail")]
+        RS[("Redis: сессии")]
+        CH[("ClickHouse")]
+        CEPH[("Ceph RGW")]
+    end
+
+    OTHER["Два других ДЦ"]
+
+    PG -->|"WAL, outbox"| DBZ --> K
+    LB -->|"логи"| K
+    K --> PRJ & REC
+    K -->|"логи"| CH
+    K -->|"сессии"| RS
+    PRJ -->|"индекс"| OS
+    PRJ -->|"user_orders"| CAS
+    PRJ -->|"avail"| RQ
+    PRJ -.->|"инвалидация кэша"| LB
+    REC -->|"user_feed"| CAS
+    RPR -->|"снятие броней продажи"| PG
+
+    PG -.->|"асинхронная репликация"| OTHER
+    K <-.->|"MirrorMaker 2"| OTHER
+    CAS <-.->|"кольцо на 3 ДЦ"| OTHER
+    CEPH -.->|"копия объектов"| OTHER
+```
+
+### Балансировка
+
+**Внешняя** балансировка: GeoDNS по задержке с весом по загрузке ДЦ. Запросы, связанные с оплатой, проксируются в домашний ДЦ. Меда файлы идут через Anycast CDN. Очередь на покупку также "балансирует" наши запросы.
+
+#### Внутренняя
+
+| Что и куда                     | Каким образом                                                            |
+| ------------------------------ | ------------------------------------------------------------------------ |
+| Маршрутизаторы в L4            | ECMP по 5-tuple на общий VIP                                             |
+| L4 в L7                        | LVS, Maglev hashing, IP-in-IP, ответ напрямую клиенту (DSR)              |
+| L7 в K8S pod-ы                 | NGINX Ingress, least connections                                         |
+| Сервис в PostgreSQL            | PgBouncer (transaction pooling); Запись через HAProxy в Primary по Patroni, чтение через `leastconn` с `lag < 1MB` |
+| `checkout`                     | Bucket по `event_id`, потом в шард                                       |
+
+<!--| Сервис в Redis                 | Sentinel-aware клиенты; ключи очереди и мест в домашнем ДЦ события       |
+| Сервис в Cassandra             | Token-aware и DC-aware драйвер, `LOCAL_QUORUM`                           |
+| Сервис в OpenSearch            | Round robin по 3 узлам кластера ДЦ                                       |
+| Kafka потребителям             | Партиции по ключу сущности (`event_id`, `user_id`), consumer groups      |
+| Сервис в другой сервис         | gRPC, балансировка на клиенте (round robin по headless Service)          |-->
+
+### Потоки данных
+
+#### Чтение данных
+
+Запрос клиента переходит по GeoDNS в ближайший ДЦ, там L7 кэш забирает большинство запросов, если нет то идет в `events`/`search`/..., где запрос получают локальные реплики баз данных.
+
+Если запрос на медиа, то сначала идет через CDN, а после L7 в Ceph RGW.
+
+#### Покупка билета
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Клиент
+    participant CDN as CDN
+    participant L as Ближайший ДЦ (L7)
+    participant H as Домашний ДЦ события (queue, checkout)
+    participant R as Redis (q:, avail:)
+    participant PG as PostgreSQL (продажи)
+    participant P as Платежный провайдер
+    participant K as Debezium + Kafka
+
+    U->>L: Встает в очередь
+    L->>H: Закрытый L7-канал
+    H->>R: INCR q:event_id:seq
+    H-->>U: Подписанный токен с местом N в очереди
+    loop Каждые 15–30 с
+        U->>CDN: Статус очереди
+        CDN-->>U: Ответ с TTL 5–10 с
+    end
+    U->>L: Обмен токена, когда served не меньше N
+    L->>H: Закрытый L7-канал
+    H-->>U: Токен checkout на 10 минут
+    U->>L: Схема зала и бронь места
+    L->>H: Закрытый L7-канал
+    H->>R: Доступность мест avail:event_id
+    H->>PG: seats: free → held
+    H->>P: Платеж
+    P-->>H: Webhook: оплачено
+    H->>PG: Транзакция с созданием билета, продажей места, и т.д.
+    PG-->>K: Событие уходит в Kafka
+    K-->>R: updater обновляет avail
+```
+
+#### Технические
+
+| Что          | Как                                                  | Объем                     |
+| ------------ | ----------------------------------------------------- | ------------------------- |
+| Сессии       | `auth` в локальном Redis через Kafka в Redis в других ДЦ | ~280 / 1100 записей/с     |
+| Логи         | nginx и сервисы через Kafka в ClickHouse              | ~2900 записей/с, ~240 ГБ/день |
+| Метрики      | Prometheus в каждом ДЦ передает в Grafana             | —                         |
+| Рекомендации | События через Kafka идут в `recommender`, оттуда в Cassandra | ~700 записей/с в фоне     |
+
+#### Между датацентрами
+
+| Что                             | Механизм                                   | Синхронность             | Отставание       |
+| ------------------------------- | ------------------------------------------ | ------------------------ | ---------------- |
+| Покупка, очередь, схема зала    | Закрытый L7-канал, mTLS                    | Синхронно                | 20–75 ms        |
+| PostgreSQL (`events`, `reviews`, ...)  | Потоковая репликация            | Асинхронно               | Секунды          |
+| PostgreSQL (`seats`, `orders`, ...)    | Async standby в соседнем ДЦ                | Асинхронно               | <1 с            |
+| События Kafka, сессии           | MirrorMaker 2                              | Асинхронно               | ~1 с             |
+| `user_orders`, `user_feed`      | Встроенная репликация Cassandra            | Асинхронно, `LOCAL_QUORUM` | <1 с          |
+| Медиа                           | Копия в другой ДЦ                    | Асинхронно               | Не более нескольних минут   |
